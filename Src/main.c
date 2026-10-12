@@ -24,6 +24,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "os_sched.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -169,7 +170,8 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-
+    os_poll();
+    __WFI();
   }
   /* USER CODE END 3 */
 }
@@ -468,13 +470,112 @@ GETCHAR_PROTOTYPE
 
   while (rx_head == rx_tail)
   {
-    __WFI(); /* sleep until an interrupt (UART or SysTick) arrives */
+    os_poll(); /* keep background tasks (LED blink) running while waiting for input */
+    __WFI();   /* sleep until the next interrupt (UART or SysTick) */
   }
   ch = rx_ring[rx_tail];
   rx_tail = (rx_tail + 1U) & (RX_RING_SIZE - 1U);
 
   tx_enqueue(ch);
   return ch;
+}
+
+typedef struct
+{
+  int id;
+  uint32_t toggles_left;
+  const char *name;
+  uint8_t active;
+} blink_ctx_t;
+
+static blink_ctx_t blink_ctx;
+
+static void blink_task(void *arg)
+{
+  blink_ctx_t *c = (blink_ctx_t *)arg;
+
+  BSP_LED_Toggle(LED7);
+  if (--c->toggles_left == 0U)
+  {
+    os_task_delete(c->id);
+    c->active = 0U;
+    printf("\r\n                ** %s Toggle Test is Finished!\r\n", c->name);
+  }
+}
+
+/* Non-blocking LED test: the menu stays responsive while the LED blinks */
+static void start_blink(uint32_t period_ms, uint32_t seconds, const char *name)
+{
+  if (blink_ctx.active)
+  {
+    printf("\r\n                !! A test is already running\r\n");
+    return;
+  }
+  blink_ctx.toggles_left = (seconds * 1000U) / period_ms;
+  blink_ctx.name = name;
+  blink_ctx.id = os_task_create(blink_task, &blink_ctx, period_ms);
+  blink_ctx.active = (blink_ctx.id >= 0);
+}
+
+#define BLINK_DEFAULT_SECONDS 10U
+#define BLINK_MAX_SECONDS     3600U
+
+/* Drops a trailing CR/LF that follows the menu text, waiting briefly for it to arrive */
+static void rx_eat_eol(uint32_t wait_ms)
+{
+  uint32_t start = HAL_GetTick();
+
+  while ((HAL_GetTick() - start) < wait_ms)
+  {
+    if (rx_head != rx_tail)
+    {
+      uint8_t c = rx_ring[rx_tail];
+      if (c != '\r' && c != '\n')
+      {
+        return;
+      }
+      rx_tail = (rx_tail + 1U) & (RX_RING_SIZE - 1U);
+      return;
+    }
+    os_poll();
+  }
+}
+
+/* Asks for a duration; Enter alone keeps the default. Returns seconds. */
+static uint32_t ask_blink_seconds(void)
+{
+  uint32_t value = 0;
+  uint32_t digits = 0;
+
+  rx_eat_eol(300);
+  printf("\r\n                Duration in seconds (1-%lu, Enter = %lu): ",
+         (unsigned long)BLINK_MAX_SECONDS, (unsigned long)BLINK_DEFAULT_SECONDS);
+           fflush(stdout); /* the prompt has no newline, so push it out of the stdio buffer */
+
+           for (;;)
+  {
+    int c = __io_getchar();
+    if (c == '\r' || c == '\n')
+    {
+      break;
+    }
+    if (c >= '0' && c <= '9' && digits < 4U)
+    {
+      value = value * 10U + (uint32_t)(c - '0');
+      digits++;
+    }
+  }
+
+  if (value == 0U)
+  {
+    value = BLINK_DEFAULT_SECONDS;
+  }
+  else if (value > BLINK_MAX_SECONDS)
+  {
+    value = BLINK_MAX_SECONDS;
+  }
+  printf("\r\n");
+  return value;
 }
 
 void Test_Validation_Menu(void)
@@ -487,7 +588,6 @@ void Test_Validation_Menu(void)
   char menu2[] ="Test2";
   char menu3[] ="Test3";
   char menu_init[] ="MENU0";
-  uint8_t duration = 0;
 
   do
   {
@@ -497,7 +597,6 @@ void Test_Validation_Menu(void)
     printf("\r\n          Test3: Exit \r\n");
     strcpy(menu_select, menu_init);
     menu_option=0;
-    duration=0;
 
       menu_option = Serial_Scanf(menu_select,5);
       menu_select[5] = '\0';
@@ -513,29 +612,14 @@ void Test_Validation_Menu(void)
     else if(strncmp(menu_select, menu1, menu_option) == 0)
     {
         printf("\r\n                ** Start Fast Toggle Test : see LED7!\r\n");
-        while(duration < 50)
-        {
-          /* Toggle LED7 for error */
-          BSP_LED_Toggle(LED7);
-          HAL_Delay(100);
-          duration++;
-        }
-        printf("\r\n                ** Fast Toggle Test is Finished!\r\n");
-
+        start_blink(100, ask_blink_seconds(), "Fast");
     }
 
 /* CASE 'Test2' selected */
     else if(strncmp(menu_select, menu2, menu_option) == 0)
     {
         printf("\r\n                ** Start Slow Toggle Test : see LED7!\r\n");
-        while(duration < 50)
-        {
-          /* Toggle LED7 for error */
-          BSP_LED_Toggle(LED7);
-          HAL_Delay(500);
-          duration++;
-        }
-        printf("\r\n                ** Slow Toggle Test is Finished!\r\n");
+        start_blink(500, ask_blink_seconds(), "Slow");
     }
 
 /* CASE 'Exit' selected */
