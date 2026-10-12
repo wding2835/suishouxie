@@ -434,7 +434,7 @@ void Test_Validation_Menu(void)
     else if(strncmp(menu_select, menu2, menu_option) == 0)
     {
         printf("\r\n                ** Start Slow Toggle Test : see LED7!\r\n");
-        while(duration < 10)
+        while(duration < 50)
         {
           /* Toggle LED7 for error */
           BSP_LED_Toggle(LED7);
