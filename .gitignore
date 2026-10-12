@@ -1,12 +1,17 @@
-# STM32CubeIDE build folders
+# STM32CubeIDE and other generated build folders
 Debug/
 Release/
+build/
+cmake-build-*/
 *.d
 *.elf
 *.map
+*.list
 *.bin
 *.hex
 *.o
+*.su
+*.cyclo
 
 # STM32CubeIDE metadata
 .settings/
