@@ -23,16 +23,20 @@ Bare-metal firmware for the **Cortex-M4** core of the STM32MP157C-DK2 board. It 
 ## 3. Program flow (`Src/main.c`)
 
 ```
-HAL_Init()
- └─ if engineering mode: HAL_RCC_DeInit(); SystemClock_Config()
-MX_GPIO_Init()
-MX_USART3_UART_Init()          // name kept from the generator; see UART section
-BSP_LED_Init(LED7)
-printf banner
-loop: Serial_Scanf(name,1) until 'c'
-Test_Validation_Menu()         // Test1 / Test2 / Test3
-BSP_LED_On(LED7); printf stop banner
-while(1) {}
+main():
+ HAL_Init()
+  ?? if engineering mode: HAL_RCC_DeInit(); SystemClock_Config()
+ MX_GPIO_Init(); MX_USART3_UART_Init()   // UART4, see UART section
+ UART4 NVIC + HAL_UART_Receive_IT()
+ BSP_LED_Init(LED7)
+ os_init()                               // PendSV priority, idle task
+ os_task_create(blink_task,   prio 3)
+ os_task_create(console_task, prio 2)
+ os_start()                              // never returns
+
+console_task:  banner -> wait for 'c' -> Test_Validation_Menu() -> stop banner -> sleep forever
+blink_task:    sleeps until start_blink() gives it toggles, toggles LED7, prints "finished"
+idle task:     __WFI() loop (prio 0, inside the kernel)
 ```
 
 ### Key functions
@@ -43,12 +47,13 @@ while(1) {}
 | `MX_USART3_UART_Init()` | Initializes `huart1` (see UART section). Disables FIFO mode. |
 | `Serial_Scanf(char *ptr, int len)` | Reads up to `len` characters, ending at `\n` or `\r`. Returns the count, or `0xFF` on an invalid character. |
 | `__write()` / `__io_putchar()` | printf output. Bytes go into a 256-byte TX ring buffer (`tx_enqueue`); `tx_kick` starts `HAL_UART_Transmit_IT` and `HAL_UART_TxCpltCallback` sends the next byte. |
-| `__io_getchar()` | scanf/getchar input. Takes a byte from the 64-byte RX ring buffer (filled by `HAL_UART_RxCpltCallback`). While empty it runs `os_poll()` and `__WFI()`. Echoes through the TX ring. |
+| `__io_getchar()` | scanf/getchar input. Takes a byte from the 64-byte RX ring buffer (filled by `HAL_UART_RxCpltCallback`). While empty it calls `os_delay(1)`, so other tasks run. Echoes through the TX ring. |
 | `HAL_UART_RxCpltCallback()` / `HAL_UART_ErrorCallback()` | Push the received byte into the RX ring and re-arm reception; the error callback clears the overrun flag first. |
-| `start_blink(period_ms, seconds, name)` | Creates a scheduler task that toggles LED7. Refuses a second test while one runs. |
+| `start_blink(period_ms, seconds, name)` | Hands a toggle count to the permanent `blink_task`. Refuses a second test while one runs. |
+| `console_puts(s)` | Prints without stdio (stdio is not re-entrant); used by `blink_task`. |
 | `ask_blink_seconds()` | Prompts `Duration in seconds (1-3600, Enter = 10):`. Enter or 0 gives 10 s; above 3600 is capped. `rx_eat_eol()` drops the Enter left after the menu text; `fflush(stdout)` makes the prompt appear. |
-| `os_task_create()` / `os_task_delete()` / `os_poll()` | Cooperative periodic scheduler in `Src/os_sched.c`. |
-| `Test_Validation_Menu()` | Menu loop. `Test1` = fast blink (100 ms), `Test2` = slow blink (500 ms), each for a user-selected duration (default 10 s) running as a background task; `Test3` exits. |
+| `os_*` kernel API | Preemptive kernel in `Src/os_sched.c`; see section 5a. |
+| `Test_Validation_Menu()` | Menu loop. `Test1` = fast blink (100 ms), `Test2` = slow blink (500 ms), each for a user-selected duration (default 10 s) while `blink_task` runs it in the background; `Test3` exits. |
 | `Error_Handler()` | Toggles LED7 every 1 s forever. |
 
 ## 4. UART configuration
@@ -75,7 +80,7 @@ Always confirm that the chosen UART and pins are assigned to the M4 (not Linux) 
 | Path | Contents |
 |------|----------|
 | `Src/main.c` | Application, interrupt-driven retargeting (RX/TX ring buffers), blink task, menu. USER CODE sections must be preserved. |
-| `Src/os_sched.c`, `Inc/os_sched.h` | Cooperative periodic scheduler (up to 8 tasks). Linked into the CubeIDE project via `STM32CubeIDE/CM4/.project`. |
+| `Src/os_sched.c`, `Inc/os_sched.h` | Preemptive kernel (up to 8 tasks incl. idle). Linked into the CubeIDE project via `STM32CubeIDE/CM4/.project`. |
 | `Src/stm32mp1xx_hal_msp.c` | Low-level init: clocks, GPIO alternate functions, HSEM clock, with `PERIPH_LOCK` around GPIO access. |
 | `Src/stm32mp1xx_it.c`, `Inc/stm32mp1xx_it.h` | Interrupt handlers. |
 | `Src/system_stm32mp1xx.c` | CMSIS `SystemInit()`. |
@@ -86,6 +91,15 @@ Always confirm that the chosen UART and pins are assigned to the M4 (not Linux) 
 | `EWARM/`, `MDK-ARM/` | IAR and Keil project equivalents. |
 | `Remoteproc/` | `fw_cortex_m4.sh` and README for loading the firmware from Linux. |
 | `*.bak` | Backup copies of `main.c` and `stm32mp1xx_hal_msp.c`. |
+
+## 5a. The preemptive kernel (`Src/os_sched.c`)
+
+- **Scheduling:** fixed priority, 1-255 (higher runs first), 0 = idle. Tasks of equal priority take turns each 1 ms tick.
+- **Tick:** `SysTick_Handler` calls `os_tick()`, which wakes sleeping tasks and pends PendSV.
+- **Context switch:** `PendSV_Handler` (assembly, lowest interrupt priority 15) pushes r4-r11, LR and, if the task used the FPU, s16-s31 onto the task's stack, calls `os_switch()` to pick the next task, then restores that task. The generated `PendSV_Handler` was removed from `stm32mp1xx_it.c`.
+- **Stacks:** each task runs on its own PSP stack; interrupts use MSP. `os_start()` abandons `main`'s stack, resets MSP to `_estack`, and triggers a first switch from a throw-away boot context.
+- **Tasks** are created with a caller-supplied static stack and an initial fake exception frame; returning from a task calls `os_task_delete(-1)`.
+- **API:** `os_init`, `os_task_create`, `os_start`, `os_delay`, `os_yield`, `os_task_delete`, `os_ticks`, `os_is_running`, `os_tick`. No mutexes, semaphores or queues yet.
 
 ## 6. Memory map (`STM32MP157CAAX_RAM.ld`)
 
@@ -122,7 +136,10 @@ Always confirm that the chosen UART and pins are assigned to the M4 (not Linux) 
 - `Serial_Scanf` returns `0xFF` for characters >= 0xFF and has no terminator handling; the menu treats counts <= 0 or > 5 as invalid.
 - After the 5-character menu entry, the trailing Enter stays in the RX ring. `rx_eat_eol(300)` drops it, waiting up to 300 ms; an Enter that arrives later would be read as an empty duration (default 10 s).
 - UART4 is shared hardware. If Linux on the A7 also claims UART4, interrupts may not reach the M4.
-- The scheduler is cooperative: a task must return quickly; `printf` inside a task is fine because TX is buffered (256 bytes, excess is dropped or blocks depending on `tx_enqueue`).
+- The kernel is preemptive. Only the console task should use `printf`/`scanf` (stdio is not re-entrant); other tasks use `console_puts`. A mutex is on the roadmap.
+- `BSP_LED_*` is called from two tasks without a lock (minor, accepted for now).
+- Console input still polls with `os_delay(1)`; semaphores will replace it.
+- Fixed task stacks (console 4 KB, blink 1 KB, idle 512 B); no overflow check yet (stacks are pre-filled with `0xA5A5A5A5` to help inspect usage).
 - `readme.txt` is the original ST text and still describes USART3 with odd parity; it does not match the code (UART4, 8N1).
 - The init function is still called `MX_USART3_UART_Init` and the handle `huart1` (generator leftovers).
 - An STM32CubeIDE update once caused debug-connect failures; a clean reinstall of the IDE (1.18.1 era) resolved it. The root cause (IDE vs ST-Link firmware vs OpenOCD) was never confirmed.
@@ -147,11 +164,12 @@ Goal: a home-made, Linux-like but smaller OS with real-time capability. The M4 r
 | Interrupt-driven UART RX with ring buffer, menu overflow fix | `e982b46` |
 | Interrupt-driven UART TX with ring buffer | `2cae4f9` |
 | Cooperative scheduler, non-blocking LED tests, selectable blink duration (default 10 s) | `c51c9b2` |
+| **Preemptive scheduler** (PendSV switch, SysTick tick, priorities, per-task stacks, idle task); console and blink tasks | see git log |
 
 ### Next (roadmap)
 
-1. **Preemptive scheduler**: PendSV context switch, SysTick tick, per-task stacks and priorities (replaces `os_poll()`).
-2. Mutexes, semaphores and queues; replace the `__disable_irq` sections where possible.
+1. ~~Preemptive scheduler~~ done.
+2. **Next:** mutex, semaphores and queues; use them for the UART RX wait (replacing `os_delay(1)` polling), TX ring and stdio locking, replacing `__disable_irq` sections where possible.
 3. Heap allocator, stack-overflow detection, MPU protection.
 4. Simple shell on the UART (commands instead of the fixed menu).
 5. rpmsg/OpenAMP link to Linux on the A7.

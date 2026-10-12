@@ -58,6 +58,12 @@ static volatile uint32_t tx_head; /* written by the producer */
 static volatile uint32_t tx_tail; /* written by tx_kick (IRQs masked) */
 static volatile uint8_t tx_busy;
 static uint8_t tx_byte;
+
+/* Kernel tasks: priority 3 = LED blink worker, 2 = console, 0 = idle (inside the kernel) */
+#define CONSOLE_STACK_WORDS 1024U
+#define BLINK_STACK_WORDS   256U
+static uint32_t console_stack[CONSOLE_STACK_WORDS] __attribute__((aligned(8)));
+static uint32_t blink_stack[BLINK_STACK_WORDS] __attribute__((aligned(8)));
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -81,6 +87,8 @@ static void MX_USART3_UART_Init(void);
 #endif /* __GNUC__ */
 
 void Test_Validation_Menu(void);
+static void console_task(void *arg);
+static void blink_task(void *arg);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -97,7 +105,6 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-	 char name[5] = "START";
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -136,31 +143,11 @@ int main(void)
   /* Configure LED7 */
   BSP_LED_Init(LED7);
 
-  /* Output a message on Hyperterminal using printf function */
-  printf("\n\r*********************************************");
-  printf("\n\r** Start UART Receive and Transmit Example **");
-  printf("\n\r*********************************************\n\r");
-  printf("\n\r");
-  printf("\n\r    ** Retarget the C library 'printf' function to the UART\n\r");
-  printf("\n\r        >> Printf = Test finished successfully. ** \n\r");
-
-  printf("\n\r    ** Press c to continue with 'getchar' test !!! \r\n");
-  while (name[0] != 'c')
-  {
-    Serial_Scanf(name, 1);
-    if (name[0] != 'c')
-      {
-      printf("\n\r !!! Invalid Character, please press c to continue the test !!! \r\n");
-      }
-  }
-
-  Test_Validation_Menu();
-
-  BSP_LED_On(LED7);
-  printf("\n\r");
-  printf("\n\r********************************************");
-  printf("\n\r** Stop UART Receive and Transmit Example **");
-  printf("\n\r********************************************\n\r");
+  /* The application runs in tasks; main() only sets them up and starts the kernel */
+  os_init();
+  os_task_create(blink_task, NULL, 3, blink_stack, BLINK_STACK_WORDS);
+  os_task_create(console_task, NULL, 2, console_stack, CONSOLE_STACK_WORDS);
+  os_start(); /* never returns */
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -170,8 +157,6 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    os_poll();
-    __WFI();
   }
   /* USER CODE END 3 */
 }
@@ -354,6 +339,45 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
+static void console_task(void *arg)
+{
+  (void)arg;
+
+  char name[5] = "START";
+
+  /* Output a message on Hyperterminal using printf function */
+  printf("\n\r*********************************************");
+  printf("\n\r** Start UART Receive and Transmit Example **");
+  printf("\n\r*********************************************\n\r");
+  printf("\n\r");
+  printf("\n\r    ** Retarget the C library 'printf' function to the UART\n\r");
+  printf("\n\r        >> Printf = Test finished successfully. ** \n\r");
+
+  printf("\n\r    ** Press c to continue with 'getchar' test !!! \r\n");
+  while (name[0] != 'c')
+  {
+    Serial_Scanf(name, 1);
+    if (name[0] != 'c')
+      {
+      printf("\n\r !!! Invalid Character, please press c to continue the test !!! \r\n");
+      }
+  }
+
+  Test_Validation_Menu();
+
+  BSP_LED_On(LED7);
+  printf("\n\r");
+  printf("\n\r********************************************");
+  printf("\n\r** Stop UART Receive and Transmit Example **");
+  printf("\n\r********************************************\n\r");
+
+  for (;;)
+  {
+    os_delay(1000);
+  }
+}
+
+
 int Serial_Scanf(char *ptr, int len)
 {
 
@@ -401,17 +425,43 @@ static void tx_kick(void)
 
 static void tx_enqueue(uint8_t c)
 {
-  uint32_t next = (tx_head + 1U) & (TX_RING_SIZE - 1U);
-
-  while (next == tx_tail)
+  /* Several tasks may print, so the whole ring update is one critical section */
+  for (;;)
   {
-    __WFI(); /* ring full: wait for the TX interrupt to drain it */
+    uint32_t primask = __get_PRIMASK();
+    uint32_t next;
+
+    __disable_irq();
+    next = (tx_head + 1U) & (TX_RING_SIZE - 1U);
+    if (next != tx_tail)
+    {
+      tx_ring[tx_head] = c;
+      tx_head = next;
+      tx_kick();
+      __set_PRIMASK(primask);
+      return;
+    }
+    __set_PRIMASK(primask);
+
+    /* Ring full: let other tasks run while the TX interrupt drains it */
+    if (os_is_running())
+    {
+      os_delay(1);
+    }
+    else
+    {
+      __WFI();
+    }
   }
-  __disable_irq();
-  tx_ring[tx_head] = c;
-  tx_head = next;
-  tx_kick();
-  __enable_irq();
+}
+
+/* Writes a string without going through stdio, safe to use from any task */
+static void console_puts(const char *s)
+{
+  while (*s != '\0')
+  {
+    tx_enqueue((uint8_t)*s++);
+  }
 }
 
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
@@ -470,8 +520,7 @@ GETCHAR_PROTOTYPE
 
   while (rx_head == rx_tail)
   {
-    os_poll(); /* keep background tasks (LED blink) running while waiting for input */
-    __WFI();   /* sleep until the next interrupt (UART or SysTick) */
+    os_delay(1); /* other tasks (LED blink) keep running while this one waits for input */
   }
   ch = rx_ring[rx_tail];
   rx_tail = (rx_tail + 1U) & (RX_RING_SIZE - 1U);
@@ -482,24 +531,37 @@ GETCHAR_PROTOTYPE
 
 typedef struct
 {
-  int id;
-  uint32_t toggles_left;
-  const char *name;
-  uint8_t active;
+  volatile uint32_t period_ms;
+  volatile uint32_t toggles_left;
+  const char *volatile name;
+  volatile uint8_t active;
 } blink_ctx_t;
 
 static blink_ctx_t blink_ctx;
 
+/* Long-lived worker: sleeps until start_blink() gives it toggles to do */
 static void blink_task(void *arg)
 {
-  blink_ctx_t *c = (blink_ctx_t *)arg;
+  (void)arg;
 
-  BSP_LED_Toggle(LED7);
-  if (--c->toggles_left == 0U)
+  for (;;)
   {
-    os_task_delete(c->id);
-    c->active = 0U;
-    printf("\r\n                ** %s Toggle Test is Finished!\r\n", c->name);
+    if (blink_ctx.toggles_left != 0U)
+    {
+      BSP_LED_Toggle(LED7);
+      if (--blink_ctx.toggles_left == 0U)
+      {
+        blink_ctx.active = 0U;
+        console_puts("\r\n                ** ");
+        console_puts(blink_ctx.name);
+        console_puts(" Toggle Test is Finished!\r\n");
+      }
+      os_delay(blink_ctx.period_ms);
+    }
+    else
+    {
+      os_delay(20);
+    }
   }
 }
 
@@ -511,10 +573,10 @@ static void start_blink(uint32_t period_ms, uint32_t seconds, const char *name)
     printf("\r\n                !! A test is already running\r\n");
     return;
   }
-  blink_ctx.toggles_left = (seconds * 1000U) / period_ms;
+  blink_ctx.period_ms = period_ms;
   blink_ctx.name = name;
-  blink_ctx.id = os_task_create(blink_task, &blink_ctx, period_ms);
-  blink_ctx.active = (blink_ctx.id >= 0);
+  blink_ctx.active = 1U;
+  blink_ctx.toggles_left = (seconds * 1000U) / period_ms; /* set last: it releases the worker */
 }
 
 #define BLINK_DEFAULT_SECONDS 10U
@@ -523,9 +585,9 @@ static void start_blink(uint32_t period_ms, uint32_t seconds, const char *name)
 /* Drops a trailing CR/LF that follows the menu text, waiting briefly for it to arrive */
 static void rx_eat_eol(uint32_t wait_ms)
 {
-  uint32_t start = HAL_GetTick();
+  uint32_t start = os_ticks();
 
-  while ((HAL_GetTick() - start) < wait_ms)
+  while ((os_ticks() - start) < wait_ms)
   {
     if (rx_head != rx_tail)
     {
@@ -537,7 +599,7 @@ static void rx_eat_eol(uint32_t wait_ms)
       rx_tail = (rx_tail + 1U) & (RX_RING_SIZE - 1U);
       return;
     }
-    os_poll();
+    os_delay(1);
   }
 }
 
