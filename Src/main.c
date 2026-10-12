@@ -50,6 +50,13 @@ static volatile uint8_t rx_ring[RX_RING_SIZE];
 static volatile uint32_t rx_head; /* written by the ISR */
 static volatile uint32_t rx_tail; /* written by the reader */
 static uint8_t rx_byte;
+
+#define TX_RING_SIZE 256U /* must be a power of two */
+static uint8_t tx_ring[TX_RING_SIZE];
+static volatile uint32_t tx_head; /* written by the producer */
+static volatile uint32_t tx_tail; /* written by tx_kick (IRQs masked) */
+static volatile uint8_t tx_busy;
+static uint8_t tx_byte;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -375,11 +382,50 @@ int Serial_Scanf(char *ptr, int len)
   * @retval None
   */
 
+static void tx_kick(void)
+{
+  /* Caller must have interrupts masked. Starts sending if idle and data is queued. */
+  if (!tx_busy && tx_head != tx_tail)
+  {
+    tx_byte = tx_ring[tx_tail];
+    tx_tail = (tx_tail + 1U) & (TX_RING_SIZE - 1U);
+    tx_busy = 1U;
+    if (HAL_UART_Transmit_IT(&huart1, &tx_byte, 1) != HAL_OK)
+    {
+      tx_busy = 0U;
+    }
+  }
+}
+
+static void tx_enqueue(uint8_t c)
+{
+  uint32_t next = (tx_head + 1U) & (TX_RING_SIZE - 1U);
+
+  while (next == tx_tail)
+  {
+    __WFI(); /* ring full: wait for the TX interrupt to drain it */
+  }
+  __disable_irq();
+  tx_ring[tx_head] = c;
+  tx_head = next;
+  tx_kick();
+  __enable_irq();
+}
+
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == huart1.Instance)
+  {
+    tx_busy = 0U;
+    tx_kick();
+  }
+}
+
 int __write(int file, char *buf, int size)
 {
   (void)file;
   (void)size;
-  HAL_UART_Transmit(&huart1, (uint8_t *)buf, 1, 0xFFFF);
+  tx_enqueue((uint8_t)buf[0]);
   return 1;
 }
 
@@ -427,7 +473,7 @@ GETCHAR_PROTOTYPE
   ch = rx_ring[rx_tail];
   rx_tail = (rx_tail + 1U) & (RX_RING_SIZE - 1U);
 
-  HAL_UART_Transmit(&huart1, &ch, 1, 0xFFFF);
+  tx_enqueue(ch);
   return ch;
 }
 
