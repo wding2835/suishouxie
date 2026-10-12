@@ -6,7 +6,7 @@ Bare-metal firmware for the **Cortex-M4** core of the STM32MP157C-DK2 board. It 
 
 1. Prints a banner and waits for the user to type `c`.
 2. Shows a menu (`Test1`, `Test2`, `Test3`) via `Test_Validation_Menu()`.
-3. Blinks LED7 fast or slow depending on the choice, or exits.
+3. Asks for a blink duration (default 10 s), then blinks LED7 fast (100 ms) or slow (500 ms) in the background while the menu stays responsive; or exits.
 4. Turns LED7 on at the end; blinks it (1 s toggle) if `Error_Handler()` is reached.
 
 ## 2. System context (dual core)
@@ -42,9 +42,13 @@ while(1) {}
 | `SystemClock_Config()` | Configures HSE/HSI/LSE and PLL1–PLL4, and the MPU/AXI/MCU/APB dividers. Engineering mode only. |
 | `MX_USART3_UART_Init()` | Initializes `huart1` (see UART section). Disables FIFO mode. |
 | `Serial_Scanf(char *ptr, int len)` | Reads up to `len` characters, ending at `\n` or `\r`. Returns the count, or `0xFF` on an invalid character. |
-| `__write()` / `__io_putchar()` | printf output. Transmits one character per call with `HAL_UART_Transmit`. |
-| `__io_getchar()` | scanf/getchar input. Clears the overrun flag, receives one character, and echoes it. |
-| `Test_Validation_Menu()` | Menu loop. `Test1` toggles LED7 50× at 100 ms, `Test2` toggles it 10× at 500 ms, `Test3` exits. |
+| `__write()` / `__io_putchar()` | printf output. Bytes go into a 256-byte TX ring buffer (`tx_enqueue`); `tx_kick` starts `HAL_UART_Transmit_IT` and `HAL_UART_TxCpltCallback` sends the next byte. |
+| `__io_getchar()` | scanf/getchar input. Takes a byte from the 64-byte RX ring buffer (filled by `HAL_UART_RxCpltCallback`). While empty it runs `os_poll()` and `__WFI()`. Echoes through the TX ring. |
+| `HAL_UART_RxCpltCallback()` / `HAL_UART_ErrorCallback()` | Push the received byte into the RX ring and re-arm reception; the error callback clears the overrun flag first. |
+| `start_blink(period_ms, seconds, name)` | Creates a scheduler task that toggles LED7. Refuses a second test while one runs. |
+| `ask_blink_seconds()` | Prompts `Duration in seconds (1-3600, Enter = 10):`. Enter or 0 gives 10 s; above 3600 is capped. `rx_eat_eol()` drops the Enter left after the menu text; `fflush(stdout)` makes the prompt appear. |
+| `os_task_create()` / `os_task_delete()` / `os_poll()` | Cooperative periodic scheduler in `Src/os_sched.c`. |
+| `Test_Validation_Menu()` | Menu loop. `Test1` = fast blink (100 ms), `Test2` = slow blink (500 ms), each for a user-selected duration (default 10 s) running as a background task; `Test3` exits. |
 | `Error_Handler()` | Toggles LED7 every 1 s forever. |
 
 ## 4. UART configuration
@@ -60,6 +64,7 @@ while(1) {}
 | Flow control | None |
 | Oversampling | 8× |
 | FIFO | Disabled |
+| Interrupt | `UART4_IRQHandler` in `Src/stm32mp1xx_it.c` calls `HAL_UART_IRQHandler(&huart1)`; NVIC priority 5 |
 
 `stm32mp1xx_hal_msp.c` still contains the original USART3 branch (PB10 AF7 / PB12 AF8) alongside the added UART4 branch, so either instance can be initialized. The function name `MX_USART3_UART_Init` and the comments are historical. To go back to USART3 on CN2 as in the original readme, set `Instance = USART3` and restore the parity/word-length settings from ST's original example (kept in `main.c.bak` if you need a reference).
 
@@ -69,7 +74,8 @@ Always confirm that the chosen UART and pins are assigned to the M4 (not Linux) 
 
 | Path | Contents |
 |------|----------|
-| `Src/main.c` | Application, retargeting, menu. USER CODE sections must be preserved. |
+| `Src/main.c` | Application, interrupt-driven retargeting (RX/TX ring buffers), blink task, menu. USER CODE sections must be preserved. |
+| `Src/os_sched.c`, `Inc/os_sched.h` | Cooperative periodic scheduler (up to 8 tasks). Linked into the CubeIDE project via `STM32CubeIDE/CM4/.project`. |
 | `Src/stm32mp1xx_hal_msp.c` | Low-level init: clocks, GPIO alternate functions, HSEM clock, with `PERIPH_LOCK` around GPIO access. |
 | `Src/stm32mp1xx_it.c`, `Inc/stm32mp1xx_it.h` | Interrupt handlers. |
 | `Src/system_stm32mp1xx.c` | CMSIS `SystemInit()`. |
@@ -107,15 +113,20 @@ Always confirm that the chosen UART and pins are assigned to the M4 (not Linux) 
 
 **Terminal:** open the board's serial port at 115200, 8N1 (matching the code above), then:
 1. Type `c`.
-2. At the menu, type `Test1`, `Test2` or `Test3` and press Enter.
+2. At the menu, type `Test1`, `Test2` or `Test3`. For Test1/Test2 a duration prompt follows: type seconds and press Enter, or just Enter for 10 s.
+3. The menu returns immediately while LED7 blinks; a message prints when the test finishes.
 
 ## 8. Known issues and notes
 
-- `Test_Validation_Menu()` declares `char menu_select[5]` but `strcpy(menu_select, "MENU0")` writes 6 bytes (including the null terminator). This overruns the buffer by one byte; increase the buffer to 6.
-- `Serial_Scanf(menu_select, 5)` reads at most 5 characters and does not null-terminate. Comparison uses `strncmp(..., menu_option)`, so an empty input (count 0) matches `Test1` by accident.
-- Test duration: Test1 runs 50 × 100 ms and Test2 runs 10 × 500 ms, so both last about 5 s, as the readme says.
-- An STM32CubeIDE update once caused debug-connect failures; a clean reinstall of the IDE (1.18.1 era) resolved it.
-
+- Fixed: `menu_select` is now 6 bytes and null-terminated, and empty or invalid input is rejected.
+- `Serial_Scanf` returns `0xFF` for characters >= 0xFF and has no terminator handling; the menu treats counts <= 0 or > 5 as invalid.
+- After the 5-character menu entry, the trailing Enter stays in the RX ring. `rx_eat_eol(300)` drops it, waiting up to 300 ms; an Enter that arrives later would be read as an empty duration (default 10 s).
+- UART4 is shared hardware. If Linux on the A7 also claims UART4, interrupts may not reach the M4.
+- The scheduler is cooperative: a task must return quickly; `printf` inside a task is fine because TX is buffered (256 bytes, excess is dropped or blocks depending on `tx_enqueue`).
+- `readme.txt` is the original ST text and still describes USART3 with odd parity; it does not match the code (UART4, 8N1).
+- The init function is still called `MX_USART3_UART_Init` and the handle `huart1` (generator leftovers).
+- An STM32CubeIDE update once caused debug-connect failures; a clean reinstall of the IDE (1.18.1 era) resolved it. The root cause (IDE vs ST-Link firmware vs OpenOCD) was never confirmed.
+- The ARM toolchain is only inside CubeIDE, so builds and tests are done from the IDE. After adding a source file, edit `.project` (link) and close/reopen the project.
 ## 9. Debug-session messages and what they mean
 
 | Message | Meaning |
@@ -123,3 +134,33 @@ Always confirm that the chosen UART and pins are assigned to the M4 (not Linux) 
 | `Unable to match requested speed 8000 kHz, using 4000 kHz` | Harmless; the probe fell back to a supported SWD clock. |
 | `Failed to read memory at ...` / `Failed to write memory` | The target could not be accessed during reset or load. Check the IDE/OpenOCD version and that Linux isn't holding the M4. |
 | `Error executing event examine-end ... ocd_process_reset` | The OpenOCD reset script failed; the M4 was left in an invalid startup state. |
+
+## 10. Project status and next steps
+
+Goal: a home-made, Linux-like but smaller OS with real-time capability. The M4 runs the real-time kernel; Linux stays on the A7; they talk over rpmsg/OpenAMP.
+
+### Done (all tested on the board)
+
+| Step | Commit |
+|------|--------|
+| Debug fix (IDE reinstall), project documentation | `ab5d671` |
+| Interrupt-driven UART RX with ring buffer, menu overflow fix | `e982b46` |
+| Interrupt-driven UART TX with ring buffer | `2cae4f9` |
+| Cooperative scheduler, non-blocking LED tests, selectable blink duration (default 10 s) | `c51c9b2` |
+
+### Next (roadmap)
+
+1. **Preemptive scheduler**: PendSV context switch, SysTick tick, per-task stacks and priorities (replaces `os_poll()`).
+2. Mutexes, semaphores and queues; replace the `__disable_irq` sections where possible.
+3. Heap allocator, stack-overflow detection, MPU protection.
+4. Simple shell on the UART (commands instead of the fixed menu).
+5. rpmsg/OpenAMP link to Linux on the A7.
+6. Measure interrupt latency and jitter (e.g. DWT cycle counter) to prove the real-time behaviour.
+7. Decide whether to evaluate FreeRTOS from the ST package first.
+
+### Quick pick-up checklist
+
+- Build and debug in STM32CubeIDE (`STM32CubeIDE/CM4`); terminal on COM11 at 115200 8N1 (Tera Term).
+- Healthy debug state: PC around `0x1000xxxx`, MSP around `0x1003ff80`.
+- Keep edits inside USER CODE sections; lock shared peripherals with `PERIPH_LOCK`/`PERIPH_UNLOCK`.
+- Workflow so far: the AI assistant edits the code, the user builds and tests, then commit and push (with the Co-authored-by trailer).

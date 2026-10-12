@@ -45,18 +45,22 @@ Rx Pin: PB12 (CN2, pin 10)
 
 The USART is configured as follows:
     - BaudRate = 115200 baud
-    - Word Length = 8 Bits (7 data bit + 1 parity bit)
+    - Word Length = 8 Bits (no parity)
     - One Stop Bit
-    - Odd parity
+    - No parity
     - Hardware flow control disabled (RTS and CTS signals: not usefull for this example) 
     - Reception and transmission are enabled in the time
 
 The user sees some printf messages on the Hyperterminal console.
 He has to type "c" to continue with getchar test.
 A menu is displayed, and the user can select:
-- "Test1" to execute fast LED7 blink (during 5s)
-- "Test2" to execute slow LED7 blink (during 5s)
+- "Test1" to execute fast LED7 blink (100 ms toggle); asks for the duration in seconds (Enter = 10 s)
+- "Test2" to execute slow LED7 blink (500 ms toggle); asks for the duration in seconds (Enter = 10 s)
 - "Test3" to quit the example
+
+@note This firmware is now interrupt-driven: UART4 RX/TX use ring buffers (UART4_IRQHandler), the blink tests run as
+      background tasks of a small cooperative scheduler (Src/os_sched.c), and the console stays responsive during a test.
+      The code uses UART4 (PG11 TX, PB2 RX), 115200 8N1. See doc/Project_Overview.md.
 
 STM32MP157C-DK2 board LED is used to monitor:
 - LED7 is blinking fastly or slowly during Test1 and Test2.
