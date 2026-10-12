@@ -50,6 +50,8 @@ UART_HandleTypeDef huart1;
 static volatile uint8_t rx_ring[RX_RING_SIZE];
 static volatile uint32_t rx_head; /* written by the ISR */
 static volatile uint32_t rx_tail; /* written by the reader */
+static os_sem_t rx_sem;           /* counts bytes waiting in the RX ring */
+static os_mutex_t led_mutex;      /* LED7 is touched by two tasks */
 static uint8_t rx_byte;
 
 #define TX_RING_SIZE 256U /* must be a power of two */
@@ -144,6 +146,8 @@ int main(void)
   BSP_LED_Init(LED7);
 
   /* The application runs in tasks; main() only sets them up and starts the kernel */
+  os_sem_init(&rx_sem, 0);
+  os_mutex_init(&led_mutex);
   os_init();
   os_task_create(blink_task, NULL, 3, blink_stack, BLINK_STACK_WORDS);
   os_task_create(console_task, NULL, 2, console_stack, CONSOLE_STACK_WORDS);
@@ -365,7 +369,9 @@ static void console_task(void *arg)
 
   Test_Validation_Menu();
 
+  os_mutex_lock(&led_mutex);
   BSP_LED_On(LED7);
+  os_mutex_unlock(&led_mutex);
   printf("\n\r");
   printf("\n\r********************************************");
   printf("\n\r** Stop UART Receive and Transmit Example **");
@@ -500,6 +506,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
     {
       rx_ring[rx_head] = rx_byte;
       rx_head = next;
+      os_sem_give(&rx_sem);
     }
     HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
   }
@@ -518,10 +525,7 @@ GETCHAR_PROTOTYPE
 {
   uint8_t ch;
 
-  while (rx_head == rx_tail)
-  {
-    os_delay(1); /* other tasks (LED blink) keep running while this one waits for input */
-  }
+  (void)os_sem_take(&rx_sem, OS_WAIT_FOREVER); /* sleeps until the UART ISR delivers a byte */
   ch = rx_ring[rx_tail];
   rx_tail = (rx_tail + 1U) & (RX_RING_SIZE - 1U);
 
@@ -548,7 +552,9 @@ static void blink_task(void *arg)
   {
     if (blink_ctx.toggles_left != 0U)
     {
+      os_mutex_lock(&led_mutex);
       BSP_LED_Toggle(LED7);
+      os_mutex_unlock(&led_mutex);
       if (--blink_ctx.toggles_left == 0U)
       {
         blink_ctx.active = 0U;
@@ -585,21 +591,17 @@ static void start_blink(uint32_t period_ms, uint32_t seconds, const char *name)
 /* Drops a trailing CR/LF that follows the menu text, waiting briefly for it to arrive */
 static void rx_eat_eol(uint32_t wait_ms)
 {
-  uint32_t start = os_ticks();
-
-  while ((os_ticks() - start) < wait_ms)
+  if (os_sem_take(&rx_sem, wait_ms))
   {
-    if (rx_head != rx_tail)
+    uint8_t c = rx_ring[rx_tail];
+    if (c == '\r' || c == '\n')
     {
-      uint8_t c = rx_ring[rx_tail];
-      if (c != '\r' && c != '\n')
-      {
-        return;
-      }
       rx_tail = (rx_tail + 1U) & (RX_RING_SIZE - 1U);
-      return;
     }
-    os_delay(1);
+    else
+    {
+      os_sem_give(&rx_sem); /* not an end of line: leave it for the next reader */
+    }
   }
 }
 

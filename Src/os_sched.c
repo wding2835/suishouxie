@@ -3,14 +3,16 @@
 
 #define STACK_FILL 0xA5A5A5A5U
 
-typedef enum { T_FREE = 0, T_READY, T_SLEEP } task_state_t;
+typedef enum { T_FREE = 0, T_READY, T_SLEEP, T_WAIT } task_state_t;
 
 typedef struct
 {
   uint32_t sp; /* saved process stack pointer */
   uint32_t wake;
+  const void *wait_obj; /* semaphore this task is blocked on, NULL when not waiting */
   uint8_t prio;
   uint8_t state;
+  uint8_t timed;        /* T_WAIT with a timeout: wake is the deadline */
 } tcb_t;
 
 static tcb_t tcbs[OS_MAX_TASKS];
@@ -87,6 +89,8 @@ int os_task_create(os_task_fn fn, void *arg, uint8_t prio, uint32_t *stack, uint
 
     tcbs[id].sp = (uint32_t)sp;
     tcbs[id].prio = prio;
+    tcbs[id].wait_obj = NULL;
+    tcbs[id].timed = 0U;
     tcbs[id].state = T_READY;
   }
   __set_PRIMASK(primask);
@@ -158,6 +162,11 @@ void os_tick(void)
     {
       tcbs[i].state = T_READY;
     }
+    else if (tcbs[i].state == T_WAIT && tcbs[i].timed && (int32_t)(tick_count - tcbs[i].wake) >= 0)
+    {
+      tcbs[i].wait_obj = NULL; /* timed out: the waiter sees it was not woken by a give */
+      tcbs[i].state = T_READY;
+    }
   }
   SCB->ICSR = SCB_ICSR_PENDSVSET_Msk; /* re-evaluate who should run, and rotate equal priorities */
 }
@@ -210,6 +219,93 @@ void os_task_delete(int id)
   {
     /* never scheduled again; PendSV switches away */
   }
+}
+
+void os_sem_init(os_sem_t *s, uint32_t initial)
+{
+  s->count = initial;
+}
+
+/* Wakes the highest-priority task waiting on s; caller holds PRIMASK */
+static void sem_wake_one(const os_sem_t *s)
+{
+  int best = -1;
+
+  for (int i = 0; i < (int)OS_MAX_TASKS; i++)
+  {
+    if (tcbs[i].state == T_WAIT && tcbs[i].wait_obj == s && (best < 0 || tcbs[i].prio > tcbs[best].prio))
+    {
+      best = i;
+    }
+  }
+  if (best >= 0)
+  {
+    tcbs[best].wait_obj = NULL;
+    tcbs[best].state = T_READY;
+    SCB->ICSR = SCB_ICSR_PENDSVSET_Msk;
+  }
+}
+
+void os_sem_give(os_sem_t *s)
+{
+  uint32_t primask = __get_PRIMASK();
+
+  __disable_irq();
+  s->count++;
+  sem_wake_one(s);
+  __set_PRIMASK(primask);
+}
+
+int os_sem_take(os_sem_t *s, uint32_t timeout_ms)
+{
+  uint32_t deadline = tick_count + timeout_ms;
+  int ok = 0;
+
+  for (;;)
+  {
+    uint32_t primask = __get_PRIMASK();
+
+    __disable_irq();
+    if (s->count > 0U)
+    {
+      s->count--;
+      ok = 1;
+    }
+    else if (timeout_ms == 0U || !running ||
+             (timeout_ms != OS_WAIT_FOREVER && (int32_t)(tick_count - deadline) >= 0))
+    {
+      ok = 0;
+    }
+    else
+    {
+      cur->wait_obj = s;
+      cur->timed = (timeout_ms != OS_WAIT_FOREVER);
+      cur->wake = deadline;
+      cur->state = T_WAIT;
+      SCB->ICSR = SCB_ICSR_PENDSVSET_Msk;
+      __set_PRIMASK(primask);
+      __DSB();
+      __ISB();
+      continue; /* resumed by a give or by the timeout; check again */
+    }
+    __set_PRIMASK(primask);
+    return ok;
+  }
+}
+
+void os_mutex_init(os_mutex_t *m)
+{
+  os_sem_init(&m->sem, 1U);
+}
+
+void os_mutex_lock(os_mutex_t *m)
+{
+  (void)os_sem_take(&m->sem, OS_WAIT_FOREVER);
+}
+
+void os_mutex_unlock(os_mutex_t *m)
+{
+  os_sem_give(&m->sem);
 }
 
 uint32_t os_ticks(void)

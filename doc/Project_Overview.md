@@ -47,7 +47,7 @@ idle task:     __WFI() loop (prio 0, inside the kernel)
 | `MX_USART3_UART_Init()` | Initializes `huart1` (see UART section). Disables FIFO mode. |
 | `Serial_Scanf(char *ptr, int len)` | Reads up to `len` characters, ending at `\n` or `\r`. Returns the count, or `0xFF` on an invalid character. |
 | `__write()` / `__io_putchar()` | printf output. Bytes go into a 256-byte TX ring buffer (`tx_enqueue`); `tx_kick` starts `HAL_UART_Transmit_IT` and `HAL_UART_TxCpltCallback` sends the next byte. |
-| `__io_getchar()` | scanf/getchar input. Takes a byte from the 64-byte RX ring buffer (filled by `HAL_UART_RxCpltCallback`). While empty it calls `os_delay(1)`, so other tasks run. Echoes through the TX ring. |
+| `__io_getchar()` | scanf/getchar input. Takes a byte from the 64-byte RX ring buffer (filled by `HAL_UART_RxCpltCallback`). While empty it sleeps on `rx_sem` (given by the RX callback per byte). Echoes through the TX ring. |
 | `HAL_UART_RxCpltCallback()` / `HAL_UART_ErrorCallback()` | Push the received byte into the RX ring and re-arm reception; the error callback clears the overrun flag first. |
 | `start_blink(period_ms, seconds, name)` | Hands a toggle count to the permanent `blink_task`. Refuses a second test while one runs. |
 | `console_puts(s)` | Prints without stdio (stdio is not re-entrant); used by `blink_task`. |
@@ -99,7 +99,7 @@ Always confirm that the chosen UART and pins are assigned to the M4 (not Linux) 
 - **Context switch:** `PendSV_Handler` (assembly, lowest interrupt priority 15) pushes r4-r11, LR and, if the task used the FPU, s16-s31 onto the task's stack, calls `os_switch()` to pick the next task, then restores that task. The generated `PendSV_Handler` was removed from `stm32mp1xx_it.c`.
 - **Stacks:** each task runs on its own PSP stack; interrupts use MSP. `os_start()` abandons `main`'s stack, resets MSP to `_estack`, and triggers a first switch from a throw-away boot context.
 - **Tasks** are created with a caller-supplied static stack and an initial fake exception frame; returning from a task calls `os_task_delete(-1)`.
-- **API:** `os_init`, `os_task_create`, `os_start`, `os_delay`, `os_yield`, `os_task_delete`, `os_ticks`, `os_is_running`, `os_tick`. No mutexes, semaphores or queues yet.
+- **API:** `os_init`, `os_task_create`, `os_start`, `os_delay`, `os_yield`, `os_task_delete`, `os_ticks`, `os_is_running`, `os_tick`. Plus `os_sem_init/give/take` (counting semaphore, timeout or `OS_WAIT_FOREVER`; `give` is ISR-safe) and `os_mutex_init/lock/unlock` (task context only, no priority inheritance, not recursive). No queues yet.
 
 ## 6. Memory map (`STM32MP157CAAX_RAM.ld`)
 
@@ -137,8 +137,8 @@ Always confirm that the chosen UART and pins are assigned to the M4 (not Linux) 
 - After the 5-character menu entry, the trailing Enter stays in the RX ring. `rx_eat_eol(300)` drops it, waiting up to 300 ms; an Enter that arrives later would be read as an empty duration (default 10 s).
 - UART4 is shared hardware. If Linux on the A7 also claims UART4, interrupts may not reach the M4.
 - The kernel is preemptive. Only the console task should use `printf`/`scanf` (stdio is not re-entrant); other tasks use `console_puts`. A mutex is on the roadmap.
-- `BSP_LED_*` is called from two tasks without a lock (minor, accepted for now).
-- Console input still polls with `os_delay(1)`; semaphores will replace it.
+- LED7 is guarded by `led_mutex` (console and blink tasks).
+- The TX-ring-full wait still polls with `os_delay(1)`.
 - Fixed task stacks (console 4 KB, blink 1 KB, idle 512 B); no overflow check yet (stacks are pre-filled with `0xA5A5A5A5` to help inspect usage).
 - `readme.txt` is the original ST text and still describes USART3 with odd parity; it does not match the code (UART4, 8N1).
 - The init function is still called `MX_USART3_UART_Init` and the handle `huart1` (generator leftovers).
@@ -164,12 +164,13 @@ Goal: a home-made, Linux-like but smaller OS with real-time capability. The M4 r
 | Interrupt-driven UART RX with ring buffer, menu overflow fix | `e982b46` |
 | Interrupt-driven UART TX with ring buffer | `2cae4f9` |
 | Cooperative scheduler, non-blocking LED tests, selectable blink duration (default 10 s) | `c51c9b2` |
+| **Semaphores and mutex** (RX wait is now event-driven; LED mutex) | see git log |
 | **Preemptive scheduler** (PendSV switch, SysTick tick, priorities, per-task stacks, idle task); console and blink tasks | see git log |
 
 ### Next (roadmap)
 
 1. ~~Preemptive scheduler~~ done.
-2. **Next:** mutex, semaphores and queues; use them for the UART RX wait (replacing `os_delay(1)` polling), TX ring and stdio locking, replacing `__disable_irq` sections where possible.
+2. Semaphores and mutex done. **Next:** queues, a stdio lock, TX wait via semaphore, replacing remaining `__disable_irq` sections.
 3. Heap allocator, stack-overflow detection, MPU protection.
 4. Simple shell on the UART (commands instead of the fixed menu).
 5. rpmsg/OpenAMP link to Linux on the A7.

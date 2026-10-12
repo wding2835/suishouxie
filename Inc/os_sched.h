@@ -41,4 +41,27 @@ int  os_is_running(void);
 /* Must be called from SysTick_Handler every 1 ms. */
 void os_tick(void);
 
+#define OS_WAIT_FOREVER 0xFFFFFFFFU
+
+/* Counting semaphore. os_sem_give() may also be called from an interrupt handler. */
+typedef struct
+{
+  volatile uint32_t count;
+} os_sem_t;
+
+void os_sem_init(os_sem_t *s, uint32_t initial);
+void os_sem_give(os_sem_t *s);
+/* Returns 1 when taken, 0 on timeout (timeout_ms 0 = try without blocking). Tasks only. */
+int  os_sem_take(os_sem_t *s, uint32_t timeout_ms);
+
+/* Mutex for task context only; no priority inheritance, not recursive. */
+typedef struct
+{
+  os_sem_t sem;
+} os_mutex_t;
+
+void os_mutex_init(os_mutex_t *m);
+void os_mutex_lock(os_mutex_t *m);
+void os_mutex_unlock(os_mutex_t *m);
+
 #endif /* OS_SCHED_H */
