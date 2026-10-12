@@ -60,6 +60,7 @@ static volatile uint32_t tx_head; /* written by the producer */
 static volatile uint32_t tx_tail; /* written by tx_kick (IRQs masked) */
 static volatile uint8_t tx_busy;
 static uint8_t tx_byte;
+static os_sem_t tx_room_sem; /* counts free slots in the TX ring */
 
 /* Kernel tasks: priority 3 = LED blink worker, 2 = console, 0 = idle (inside the kernel) */
 #define CONSOLE_STACK_WORDS 1024U
@@ -147,6 +148,7 @@ int main(void)
 
   /* The application runs in tasks; main() only sets them up and starts the kernel */
   os_sem_init(&rx_sem, 0);
+  os_sem_init(&tx_room_sem, TX_RING_SIZE - 1U);
   os_mutex_init(&led_mutex);
   os_init();
   os_task_create(blink_task, NULL, 3, blink_stack, BLINK_STACK_WORDS);
@@ -421,6 +423,7 @@ static void tx_kick(void)
   {
     tx_byte = tx_ring[tx_tail];
     tx_tail = (tx_tail + 1U) & (TX_RING_SIZE - 1U);
+    os_sem_give(&tx_room_sem); /* a slot was freed; wakes a task blocked on a full ring */
     tx_busy = 1U;
     if (HAL_UART_Transmit_IT(&huart1, &tx_byte, 1) != HAL_OK)
     {
@@ -431,34 +434,20 @@ static void tx_kick(void)
 
 static void tx_enqueue(uint8_t c)
 {
-  /* Several tasks may print, so the whole ring update is one critical section */
-  for (;;)
+  uint32_t primask;
+
+  /* Reserve a slot first: a full ring puts the task to sleep until the TX interrupt frees one */
+  while (!os_sem_take(&tx_room_sem, OS_WAIT_FOREVER))
   {
-    uint32_t primask = __get_PRIMASK();
-    uint32_t next;
-
-    __disable_irq();
-    next = (tx_head + 1U) & (TX_RING_SIZE - 1U);
-    if (next != tx_tail)
-    {
-      tx_ring[tx_head] = c;
-      tx_head = next;
-      tx_kick();
-      __set_PRIMASK(primask);
-      return;
-    }
-    __set_PRIMASK(primask);
-
-    /* Ring full: let other tasks run while the TX interrupt drains it */
-    if (os_is_running())
-    {
-      os_delay(1);
-    }
-    else
-    {
-      __WFI();
-    }
+    __WFI(); /* scheduler not running yet: wait for the TX interrupt */
   }
+
+  primask = __get_PRIMASK();
+  __disable_irq();
+  tx_ring[tx_head] = c;
+  tx_head = (tx_head + 1U) & (TX_RING_SIZE - 1U);
+  tx_kick();
+  __set_PRIMASK(primask);
 }
 
 /* Writes a string without going through stdio, safe to use from any task */

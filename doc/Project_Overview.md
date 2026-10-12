@@ -138,7 +138,7 @@ Always confirm that the chosen UART and pins are assigned to the M4 (not Linux) 
 - UART4 is shared hardware. If Linux on the A7 also claims UART4, interrupts may not reach the M4.
 - The kernel is preemptive. Only the console task should use `printf`/`scanf` (stdio is not re-entrant); other tasks use `console_puts`. A mutex is on the roadmap.
 - LED7 is guarded by `led_mutex` (console and blink tasks).
-- The TX-ring-full wait still polls with `os_delay(1)`.
+- A full TX ring blocks the writing task on `tx_room_sem` (freed slots are given from the TX interrupt); no polling remains.
 - Fixed task stacks (console 4 KB, blink 1 KB, idle 512 B); no overflow check yet (stacks are pre-filled with `0xA5A5A5A5` to help inspect usage).
 - `readme.txt` is the original ST text and still describes USART3 with odd parity; it does not match the code (UART4, 8N1).
 - The init function is still called `MX_USART3_UART_Init` and the handle `huart1` (generator leftovers).
@@ -164,13 +164,14 @@ Goal: a home-made, Linux-like but smaller OS with real-time capability. The M4 r
 | Interrupt-driven UART RX with ring buffer, menu overflow fix | `e982b46` |
 | Interrupt-driven UART TX with ring buffer | `2cae4f9` |
 | Cooperative scheduler, non-blocking LED tests, selectable blink duration (default 10 s) | `c51c9b2` |
-| **Semaphores and mutex** (RX wait is now event-driven; LED mutex) | see git log |
+| **Semaphores and mutex** (RX wait is now event-driven; LED mutex) | `a74ef80` |
+| **TX ring-full wait via semaphore** (no polling left) | see git log |
 | **Preemptive scheduler** (PendSV switch, SysTick tick, priorities, per-task stacks, idle task); console and blink tasks | see git log |
 
 ### Next (roadmap)
 
 1. ~~Preemptive scheduler~~ done.
-2. Semaphores and mutex done. **Next:** queues, a stdio lock, TX wait via semaphore, replacing remaining `__disable_irq` sections.
+2. Semaphores and mutex done. TX wait is semaphore-based. **Next:** message queues (needed by a shell and rpmsg), a stdio lock once a second task prints, stack-overflow detection.
 3. Heap allocator, stack-overflow detection, MPU protection.
 4. Simple shell on the UART (commands instead of the fixed menu).
 5. rpmsg/OpenAMP link to Linux on the A7.
