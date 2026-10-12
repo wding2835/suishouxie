@@ -45,6 +45,11 @@
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
+#define RX_RING_SIZE 64U /* must be a power of two */
+static volatile uint8_t rx_ring[RX_RING_SIZE];
+static volatile uint32_t rx_head; /* written by the ISR */
+static volatile uint32_t rx_tail; /* written by the reader */
+static uint8_t rx_byte;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -112,6 +117,14 @@ int main(void)
   MX_USART3_UART_Init();
 
   /* USER CODE BEGIN 2 */
+  /* Interrupt-driven reception: one byte at a time into a ring buffer */
+  HAL_NVIC_SetPriority(UART4_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(UART4_IRQn);
+  if (HAL_UART_Receive_IT(&huart1, &rx_byte, 1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
   /* Configure LED7 */
   BSP_LED_Init(LED7);
 
@@ -380,14 +393,41 @@ PUTCHAR_PROTOTYPE
 }
 
 
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == huart1.Instance)
+  {
+    uint32_t next = (rx_head + 1U) & (RX_RING_SIZE - 1U);
+    if (next != rx_tail) /* drop the byte when the ring is full */
+    {
+      rx_ring[rx_head] = rx_byte;
+      rx_head = next;
+    }
+    HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
+  }
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == huart1.Instance)
+  {
+    __HAL_UART_CLEAR_OREFLAG(&huart1);
+    HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
+  }
+}
+
 GETCHAR_PROTOTYPE
 {
-  uint8_t ch = 0;
-  /* Clear the Overrun flag just before receiving the first character */
-  __HAL_UART_CLEAR_OREFLAG(&huart1);
-  
-  HAL_UART_Receive(&huart1, (uint8_t *)&ch, 1, 0xFFFF);
-  HAL_UART_Transmit(&huart1, (uint8_t *)&ch, 1, 0xFFFF);
+  uint8_t ch;
+
+  while (rx_head == rx_tail)
+  {
+    __WFI(); /* sleep until an interrupt (UART or SysTick) arrives */
+  }
+  ch = rx_ring[rx_tail];
+  rx_tail = (rx_tail + 1U) & (RX_RING_SIZE - 1U);
+
+  HAL_UART_Transmit(&huart1, &ch, 1, 0xFFFF);
   return ch;
 }
 
@@ -396,7 +436,7 @@ void Test_Validation_Menu(void)
   int menu_option = 0;
   uint8_t stop_test = 0;
 
-  char menu_select[5];
+  char menu_select[6]; /* 5 characters + terminator */
   char menu1[] ="Test1";
   char menu2[] ="Test2";
   char menu3[] ="Test3";
@@ -414,9 +454,17 @@ void Test_Validation_Menu(void)
     duration=0;
 
       menu_option = Serial_Scanf(menu_select,5);
+      menu_select[5] = '\0';
+
+/* Reject empty or invalid input */
+    if(menu_option <= 0 || menu_option > 5)
+    {
+        printf("\r\n                !! INVALID CHOICE\r\n");
+        continue;
+    }
 
 /* CASE 'Test1' selected */
-    if(strncmp(menu_select, menu1, menu_option) == 0)
+    else if(strncmp(menu_select, menu1, menu_option) == 0)
     {
         printf("\r\n                ** Start Fast Toggle Test : see LED7!\r\n");
         while(duration < 50)
