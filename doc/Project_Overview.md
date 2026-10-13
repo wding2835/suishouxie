@@ -184,3 +184,7 @@ Goal: a home-made, Linux-like but smaller OS with real-time capability. The M4 r
 - Healthy debug state: PC around `0x1000xxxx`, MSP around `0x1003ff80`.
 - Keep edits inside USER CODE sections; lock shared peripherals with `PERIPH_LOCK`/`PERIPH_UNLOCK`.
 - Workflow so far: the AI assistant edits the code, the user builds and tests, then commit and push (with the Co-authored-by trailer).
+## References
+
+- Hardware spec (local only, git-ignored): `doc/rm0436-stm32mp157-advanced-armbased-32bit-mpus-stmicroelectronics.pdf` (RM0436). Consult it for peripheral and register details (DTS, RCC, UART, HSEM, etc.).
+
