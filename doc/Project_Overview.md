@@ -53,7 +53,7 @@ idle task:     __WFI() loop (prio 0, inside the kernel)
 | `console_puts(s)` | Prints without stdio (stdio is not re-entrant); used by `blink_task`. |
 | `ask_blink_seconds()` | Prompts `Duration in seconds (1-3600, Enter = 10):`. Enter or 0 gives 10 s; above 3600 is capped. `rx_eat_eol()` drops the Enter left after the menu text; `fflush(stdout)` makes the prompt appear. |
 | `os_*` kernel API | Preemptive kernel in `Src/os_sched.c`; see section 5a. |
-| `Test_Validation_Menu()` | Menu loop. `Test1` = fast blink (100 ms), `Test2` = slow blink (500 ms), each for a user-selected duration (default 10 s) while `blink_task` runs it in the background; `Test3` exits. |
+| `Test_Validation_Menu()` | Menu loop. `Test1` = fast blink (100 ms), `Test2` = slow blink (500 ms), each for a user-selected duration (default 10 s) while `blink_task` runs it in the background; `Temp` prints the die temperature from the DTS sensor (`dts_read_mdegc()`, `print_temperature()`, ~35 C verified on board); `Test3` exits. The menu strips the trailing Enter that `Serial_Scanf` stores, so entries longer than 5 chars match. |
 | `Error_Handler()` | Toggles LED7 every 1 s forever. |
 
 ## 4. UART configuration

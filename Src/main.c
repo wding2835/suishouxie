@@ -631,6 +631,90 @@ static uint32_t ask_blink_seconds(void)
   return value;
 }
 
+/* Digital Temperature Sensor (DTS1): same method as the Linux stm_thermal driver.
+   Returns the die temperature in milli-degrees Celsius, or 0x7FFFFFFF on failure. */
+#define DTS_SAMPLING_TIME 15U
+#define DTS_FAILED        0x7FFFFFFF
+
+static int32_t dts_read_mdegc(void)
+{
+  uint32_t pclk = HAL_RCC_GetPCLK3Freq();
+  uint32_t cfg, periods = 0U, tries;
+  int32_t t0, ramp;
+  uint32_t fmt0;
+
+  __HAL_RCC_DTS_CLK_ENABLE();
+
+  if ((DTS1->CFGR1 & DTS_CFGR1_TS1_EN) == 0U)
+  {
+    uint32_t prescaler = 0U;
+
+    while (prescaler <= (pclk / 1000000U))
+    {
+      prescaler++;
+    }
+    cfg = DTS1->CFGR1;
+    cfg &= ~(DTS_CFGR1_HSREF_CLK_DIV_Msk | DTS_CFGR1_REFCLK_SEL | DTS_CFGR1_Q_MEAS_OPT | DTS_CFGR1_TS1_INTRIG_SEL_Msk);
+    cfg |= (prescaler << DTS_CFGR1_HSREF_CLK_DIV_Pos) | DTS_CFGR1_TS1_SMP_TIME_Msk; /* PCLK reference, max sampling time */
+    DTS1->CFGR1 = cfg;
+
+    DTS1->CFGR1 |= DTS_CFGR1_TS1_EN;
+    for (tries = 0U; tries < 50U && (DTS1->SR & DTS_SR_TS1_RDY) == 0U; tries++)
+    {
+      os_delay(1);
+    }
+    if ((DTS1->SR & DTS_SR_TS1_RDY) == 0U)
+    {
+      return DTS_FAILED;
+    }
+    DTS1->CFGR1 |= DTS_CFGR1_TS1_START; /* continuous measurement */
+  }
+
+  /* Factory calibration */
+  t0 = ((DTS1->T0VALR1 & DTS_T0VALR1_TS1_T0_Msk) == 0U) ? 30000 : 130000;
+  fmt0 = 100U * (DTS1->T0VALR1 & DTS_T0VALR1_TS1_FMT0_Msk);
+  ramp = (int32_t)(DTS1->RAMPVALR & DTS_RAMPVALR_TS1_RAMP_COEFF_Msk);
+  if (fmt0 == 0U || ramp == 0)
+  {
+    return DTS_FAILED;
+  }
+
+  for (tries = 0U; tries < 100U; tries++)
+  {
+    periods = DTS1->DR & DTS_DR_TS1_MFREQ_Msk;
+    if (periods != 0U)
+    {
+      break;
+    }
+    os_delay(1);
+  }
+  if (periods == 0U)
+  {
+    return DTS_FAILED;
+  }
+
+  {
+    int32_t freq = (int32_t)((pclk * DTS_SAMPLING_TIME) / periods);
+    return ((freq - (int32_t)fmt0) * 1000) / ramp + t0;
+  }
+}
+
+static void print_temperature(void)
+{
+  int32_t mdeg = dts_read_mdegc();
+
+  if (mdeg == DTS_FAILED)
+  {
+    printf("\r\n                !! Temperature sensor not ready\r\n");
+  }
+  else
+  {
+    int32_t a = (mdeg < 0) ? -mdeg : mdeg;
+    printf("\r\n                ** Die temperature: %s%ld.%01ld C\r\n",
+           (mdeg < 0) ? "-" : "", (long)(a / 1000), (long)((a % 1000) / 100));
+  }
+}
+
 void Test_Validation_Menu(void)
 {
   int menu_option = 0;
@@ -640,6 +724,7 @@ void Test_Validation_Menu(void)
   char menu1[] ="Test1";
   char menu2[] ="Test2";
   char menu3[] ="Test3";
+  char menu4[] ="Temp";
   char menu_init[] ="MENU0";
 
   do
@@ -647,11 +732,17 @@ void Test_Validation_Menu(void)
     printf("\r\n        Select the test options:\r\n");
     printf("\r\n          Test1: Fast Toggle LED");
     printf("\r\n          Test2: Slow Toggle LED");
+    printf("\r\n          Temp : Show die temperature (DTS)");
     printf("\r\n          Test3: Exit \r\n");
     strcpy(menu_select, menu_init);
     menu_option=0;
 
       menu_option = Serial_Scanf(menu_select,5);
+      if (menu_option > 0 && menu_option <= 5 &&
+          (menu_select[menu_option - 1] == '\r' || menu_select[menu_option - 1] == '\n'))
+      {
+        menu_option--; /* shorter entries such as "Temp" arrive with their Enter attached */
+      }
       menu_select[5] = '\0';
 
 /* Reject empty or invalid input */
@@ -673,6 +764,12 @@ void Test_Validation_Menu(void)
     {
         printf("\r\n                ** Start Slow Toggle Test : see LED7!\r\n");
         start_blink(500, ask_blink_seconds(), "Slow");
+    }
+
+/* CASE 'Temp' selected */
+    else if(strncmp(menu_select, menu4, menu_option) == 0)
+    {
+        print_temperature();
     }
 
 /* CASE 'Exit' selected */
